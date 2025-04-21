@@ -1,0 +1,147 @@
+README FIlE: NiFi Cluster Setup Script
+
+1. Overview
+This document provides detailed technical documentation for the Bash script designed to automate the setup of an Apache NiFi cluster with TLS security, ZooKeeper coordination, and multi-node deployment capabilities.
+
+---
+
+2. Script Purpose
+The script performs the following key functions:
+- Installs and configures Apache NiFi (v1.17.0)
+- Sets up a secure NiFi cluster with TLS certificates
+- Configures ZooKeeper for cluster coordination
+- Deploys NiFi across multiple nodes
+- Configures authentication for NiFi UI
+
+---
+
+3. Prerequisites
+#3.1 System Requirements
+- Operating System: Linux (tested on Ubuntu/CentOS)
+- Java: OpenJDK 11 (automatically installed if missing)
+- User: `nifiadmin` (created automatically)
+- Network: Passwordless SSH between nodes
+
+#3.2 Network Requirements
+- Static IPs for all cluster nodes
+- Hostnames properly configured in `/etc/hosts` or DNS
+- Ports Open:
+  - `9443` (NiFi HTTPS UI)
+  - `2181` (ZooKeeper)
+  - `2888:3888` (ZooKeeper cluster communication)
+  - `11443` (NiFi cluster node communication)
+
+---
+
+4. Script Workflow
+#4.1 Main Functions
+| Function | Description |
+|-------------|----------------|
+| `check_os` | Verifies OS compatibility |
+| `check_java` | Checks if Java is installed |
+| `install_java` | Installs OpenJDK 11 if missing |
+| `check_nifiadmin_user` | Creates `nifiadmin` user and configures SSH |
+| `download_nifi` | Downloads and extracts NiFi |
+| `download_nifi_toolkit` | Downloads NiFi Toolkit for TLS cert generation |
+| `generate_tls_certs` | Creates TLS certificates for secure communication |
+| `setup_nifiadmin_authentication` | Sets up login credentials for NiFi UI |
+| `configure_zookeeper` | Configures ZooKeeper for cluster coordination |
+| `configure_state_management` | Sets up state management for NiFi |
+| `configure_nifi_properties` | Configures `nifi.properties` for clustering |
+| `zip_distribute_local_nifi` | Distributes NiFi binaries to cluster nodes |
+| `setup_cluster_nodes` | Configures secondary nodes |
+| `start_nifi_cluster` | Starts ZooKeeper and NiFi on all nodes |
+
+---
+
+5. Key Configuration Details
+#5.1 TLS Certificate Generation
+- Uses `tls-toolkit.sh` from NiFi Toolkit
+- Generates:
+  - Keystore (`keystore.jks`)
+  - Truststore (`truststore.jks`)
+  - PEM certificates (`nifi-cert.pem`, `nifi-key.key`)
+- SANs (Subject Alternative Names) include both IPs and hostnames
+
+#5.2 ZooKeeper Configuration
+- `zookeeper.properties`:
+  ```properties
+  initLimit=10
+  syncLimit=5
+  tickTime=2000
+  dataDir=/home/nifiadmin/nifi-1.17.0/state/zookeeper
+  clientPort=2181
+  server.1=<NODE_IP1>:2888:3888
+  server.2=<NODE_IP2>:2888:3888
+  server.3=<NODE_IP3>:2888:3888
+  ```
+- `myid` file created in `dataDir` with node ID (`1`, `2`, or `3`)
+
+#5.3 NiFi Cluster Properties
+- `nifi.properties`:
+  ```properties
+  nifi.cluster.is.node=true
+  nifi.cluster.node.address=<NODE_HOSTNAME>
+  nifi.cluster.node.protocol.port=11443
+  nifi.zookeeper.connect.string=<NODE1>:2181,<NODE2>:2181,<NODE3>:2181
+  nifi.web.https.port=9443
+  nifi.security.keystore=./conf/keystore.jks
+  nifi.security.truststore=./conf/truststore.jks
+  ```
+
+---
+
+6. Execution Steps
+#6.1 Running the Script
+1. Save the script as `setup_nifi_cluster.sh`
+2. Make it executable:
+   ```bash
+   chmod +x setup_nifi_cluster.sh
+   ```
+3. Run as root (or with `sudo`):
+   ```bash
+   sudo ./setup_nifi_cluster.sh
+   ```
+
+#6.2 Expected Output
+- Prompts for cluster size (recommended: `3` nodes)
+- Asks for IPs and hostnames of each node
+- Generates TLS certificates
+- Configures ZooKeeper & NiFi
+- Starts the NiFi cluster
+
+---
+
+7. Troubleshooting
+| Issue | Solution |
+|----------|-------------|
+| `sudo: /home/nifiadmin/nifi-1.17.0/bin/nifi.sh: command not found` | Verify NiFi was downloaded correctly |
+| `ZooKeeper not running` | Check `zookeeper.properties` and `myid` file |
+| `TLS certificate generation fails` | Delete `/security_output` and retry |
+| `NiFi UI not accessible` | Check firewall rules for `9443` |
+
+---
+
+8. Security Considerations
+- Keystore/Truststore passwords should be changed (`KEYSTORE_PASSWORD`, `TRUSTSTORE_PASSWORD`)
+- NiFi UI password is set interactively (`setup_nifiadmin_authentication`)
+- ZooKeeper communication should be secured in production
+
+---
+
+9. Conclusion
+This script automates the deployment of a secure, highly available NiFi cluster with minimal manual intervention. It handles:
+✔ TLS setup  
+✔ ZooKeeper coordination  
+✔ Multi-node deployment  
+✔ Authentication configuration  
+
+For production use, consider:
+- Hardening security (custom passwords, firewall rules)
+- Monitoring (NiFi & ZooKeeper health checks)
+- Backup (flow configurations, certificates)
+
+---
+Author: Ankit  
+Last Updated: 15-04-2025  
+Version: 1.0
