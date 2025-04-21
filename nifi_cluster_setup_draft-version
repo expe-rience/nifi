@@ -1,0 +1,714 @@
+#NiFi CLuster Setup script 
+#!/bin/bash
+
+# Variables
+NIFI_VERSION="1.17.0"
+NIFI_HOME="/home/nifiadmin"
+KEYSTORE_PASSWORD="password123"
+TRUSTSTORE_PASSWORD="password123"
+CLUSTER_NODES=()
+CLUSTER_SIZE=0
+
+# Node information variables
+NODE_IP1=""
+NODE_IP2=""
+NODE_IP3=""
+NODE_NAME1=""
+NODE_NAME2=""
+NODE_NAME3=""
+
+# Function to set JAVA_HOME properly
+set_java_home() {
+    if [ -z "$JAVA_HOME" ]; then
+        export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
+        echo "JAVA_HOME set to: $JAVA_HOME"
+    fi
+    export PATH=$JAVA_HOME/bin:$PATH
+}
+
+# Function to check OS
+check_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "Detected OS: $NAME $VERSION"
+    else
+        echo "Unsupported OS"
+        exit 1
+    fi
+}
+
+# Function to check Java installation
+check_java() {
+    if ! command -v java &> /dev/null; then
+        echo "Java is not installed. Please install Java before proceeding."
+        exit 1
+    else
+        echo "Java is installed: $(java -version 2>&1 | head -n 1)"
+    fi
+}
+
+# Function to install Java
+install_java() {
+    echo "Installing Java..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y openjdk-11-jdk
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y java-11-openjdk-devel
+    else
+        echo "Package manager not found. Please install Java manually."
+        exit 1
+    fi
+
+    # Set JAVA_HOME
+    export JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    echo "Java installed successfully. JAVA_HOME set to $JAVA_HOME"
+}
+
+# Function to check/create nifiadmin user
+check_nifiadmin_user() {
+    if id "nifiadmin" &>/dev/null; then
+        echo "nifiadmin user exists"
+    else
+        echo "nifiadmin user does not exist. Creating user..."
+        sudo adduser nifiadmin
+        echo "Configuring passwordless SSH for nifiadmin user..."
+        sudo -u nifiadmin mkdir -p /home/nifiadmin/.ssh
+        sudo -u nifiadmin chmod 700 /home/nifiadmin/.ssh
+        sudo -u nifiadmin ssh-keygen -t rsa -f /home/nifiadmin/.ssh/id_rsa -q -N ""
+        sudo -u nifiadmin cp /home/nifiadmin/.ssh/id_rsa.pub /home/nifiadmin/.ssh/authorized_keys
+        sudo -u nifiadmin chmod 600 /home/nifiadmin/.ssh/authorized_keys
+    fi
+}
+
+# Function to install unzip if not present
+install_unzip() {
+    if ! command -v unzip &> /dev/null; then
+        echo "Installing unzip..."
+        if [ -f /etc/redhat-release ]; then
+            sudo yum install -y unzip
+        else
+            sudo apt-get install -y unzip
+        fi
+    fi
+}
+
+# Function to download and extract NiFi
+download_nifi() {
+    local nifi_file="nifi-${NIFI_VERSION}-bin.zip"
+    local nifi_url="https://archive.apache.org/dist/nifi/${NIFI_VERSION}/${nifi_file}"
+
+    if [ ! -d "${NIFI_HOME}/nifi-${NIFI_VERSION}" ]; then
+        echo "Downloading NiFi ${NIFI_VERSION}..."
+        sudo -u nifiadmin wget -q "${nifi_url}" -P "${NIFI_HOME}"
+        install_unzip
+        echo "Extracting NiFi..."
+        sudo -u nifiadmin unzip -q "${NIFI_HOME}/${nifi_file}" -d "${NIFI_HOME}"
+        sudo -u nifiadmin rm "${NIFI_HOME}/${nifi_file}"
+        echo "NiFi ${NIFI_VERSION} downloaded and extracted"
+    else
+        echo "NiFi ${NIFI_VERSION} is already downloaded"
+    fi
+}
+
+# Function to download and extract NiFi Toolkit
+download_nifi_toolkit() {
+    local toolkit_file="nifi-toolkit-${NIFI_VERSION}-bin.zip"
+    local toolkit_url="https://archive.apache.org/dist/nifi/${NIFI_VERSION}/${toolkit_file}"
+
+    if [ ! -d "${NIFI_HOME}/nifi-toolkit-${NIFI_VERSION}" ]; then
+        echo "Downloading NiFi Toolkit ${NIFI_VERSION}..."
+        sudo -u nifiadmin wget -q "${toolkit_url}" -P "${NIFI_HOME}"
+        install_unzip
+        echo "Extracting NiFi Toolkit..."
+        sudo -u nifiadmin unzip -q "${NIFI_HOME}/${toolkit_file}" -d "${NIFI_HOME}"
+        sudo -u nifiadmin rm "${NIFI_HOME}/${toolkit_file}"
+        echo "NiFi Toolkit ${NIFI_VERSION} downloaded and extracted"
+    else
+        echo "NiFi Toolkit ${NIFI_VERSION} is already downloaded"
+    fi
+}
+
+generate_tls_certs() {
+    set_java_home
+    
+    read -p "Enter number of cluster nodes (3 recommended): " CLUSTER_SIZE
+    
+    # Collect node information
+    for ((i=1; i<=CLUSTER_SIZE; i++)); do
+        echo "Enter details for node $i:"
+        read -p "  IP address: " ip
+        read -p "  Hostname: " hostname
+        
+        while [[ -z "$ip" || -z "$hostname" ]]; do
+            echo "Error: Both IP and hostname are required!"
+            read -p "  IP address: " ip
+            read -p "  Hostname: " hostname
+        done
+        
+        # Set both IP and hostname variables
+        case $i in
+            1) 
+                NODE_IP1="$ip"
+                NODE_NAME1="$hostname"
+                ;;
+            2) 
+                NODE_IP2="$ip"
+                NODE_NAME2="$hostname"
+                ;;
+            3) 
+                NODE_IP3="$ip"
+                NODE_NAME3="$hostname"
+                ;;
+        esac
+        
+        NODE_IPS+=("$ip")
+        NODE_NAMES+=("$hostname")
+        CERT_DNS+=("CN=$ip,OU=$hostname")
+    done
+
+    # Create comma-separated lists
+    HOSTNAMES=$(IFS=,; echo "${NODE_IPS[*]}")
+    SAN_NAMES=$(IFS=,; echo "${NODE_IPS[*]},${NODE_NAMES[*]}")
+    CERT_DETAILS=$(printf -- '-C %s ' "${CERT_DNS[@]}")
+    
+    if [ ! -d "${NIFI_HOME}/security_output" ]; then
+        echo "Generating TLS certificates with the following parameters:"
+        echo "  Hostnames: $HOSTNAMES"
+        echo "  Subject Alternative Names: $SAN_NAMES"
+        echo "  Certificate Details: ${CERT_DNS[*]}"
+        
+        # Generate certificates with all specified parameters
+        sudo "${NIFI_HOME}/nifi-toolkit-${NIFI_VERSION}/bin/tls-toolkit.sh" standalone \
+          --hostnames "$HOSTNAMES" \
+          -c "${NODE_IPS[0]}" \
+          $CERT_DETAILS \
+          -O \
+          -o "${NIFI_HOME}/security_output" \
+          --subjectAlternativeNames "$SAN_NAMES" \
+          --keyStorePassword "$KEYSTORE_PASSWORD" \
+          --trustStorePassword "$TRUSTSTORE_PASSWORD" \
+          --keyPassword "$KEYSTORE_PASSWORD"
+        sudo chown -R nifiadmin:nifiadmin "${NIFI_HOME}/security_output"
+        
+        # Verify certificate generation
+        if [ $? -eq 0 ]; then
+            echo "TLS certificates successfully generated in ${NIFI_HOME}/security_output"
+            echo "Generated files for each node:"
+            for ((i=0; i<CLUSTER_SIZE; i++)); do
+                echo "  Node $((i+1)) (${NODE_NAMES[$i]} - ${NODE_IPS[$i]}):"
+                echo "    - keystore.jks"
+                echo "    - truststore.jks"
+                echo "    - nifi-cert.pem"
+                echo "    - nifi-key.key"
+            done
+            
+            # Verify certificate details
+            echo "Verifying Certificate Details..."
+            for ((i=0; i<CLUSTER_SIZE; i++)); do
+                echo "Certificate for ${NODE_NAMES[$i]}:"
+                sudo keytool -list -v \
+                  -keystore "${NIFI_HOME}/security_output/${NODE_IPS[$i]}/keystore.jks" \
+                  -storepass "$KEYSTORE_PASSWORD" | grep -E "Owner:|Issuer:|CN=|OU=|DNS Name|IP Address"
+                echo "----------------------------------------"
+            done
+        else
+            echo "Error: Failed to generate TLS certificates"
+            exit 1
+        fi
+    else
+        echo "TLS certificates already exist in ${NIFI_HOME}/security_output. Skipping generation."
+        echo "If you want to regenerate certificates, please delete the security_output directory first."
+    fi
+}
+configure_zookeeper() {
+    local zookeeper_props="${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/zookeeper.properties"
+    local zookeeper_data_dir="${NIFI_HOME}/nifi-${NIFI_VERSION}/state/zookeeper"
+    
+    echo "Configuring Zookeeper properties for cluster"
+
+    # Backup original file
+    sudo -u nifiadmin cp "$zookeeper_props" "${zookeeper_props}.bak"
+    
+    # Add basic Zookeeper configuration
+    cat << EOF | sudo -u nifiadmin tee "$zookeeper_props" > /dev/null
+initLimit=10
+autopurge.purgeInterval=24
+syncLimit=5
+tickTime=2000
+dataDir=${zookeeper_data_dir}
+autopurge.snapRetainCount=30
+clientPort=2181
+EOF
+
+    # Add Zookeeper servers to configuration using IP addresses
+    echo "server.1=${NODE_IP1}:2888:3888" | sudo -u nifiadmin tee -a "$zookeeper_props" > /dev/null
+    echo "server.2=${NODE_IP2}:2888:3888" | sudo -u nifiadmin tee -a "$zookeeper_props" > /dev/null
+    echo "server.3=${NODE_IP3}:2888:3888" | sudo -u nifiadmin tee -a "$zookeeper_props" > /dev/null
+    
+    # Determine the node ID based on current IP address
+    local current_ip=$(hostname -I | awk '{print $1}')
+    local node_id=0
+    
+    # Check which node IP matches the current IP
+    if [ "$current_ip" == "$NODE_IP1" ]; then
+        node_id=1
+    elif [ "$current_ip" == "$NODE_IP2" ]; then
+        node_id=2
+    elif [ "$current_ip" == "$NODE_IP3" ]; then
+        node_id=3
+    fi
+    
+    if [ "$node_id" -eq 0 ]; then
+        echo "Error: Current IP $current_ip not found in cluster nodes configuration"
+        echo "Configured node IPs:"
+        echo "Node 1: $NODE_IP1"
+        echo "Node 2: $NODE_IP2"
+        echo "Node 3: $NODE_IP3"
+        exit 1
+    fi
+    
+    # Create and configure myid file
+    echo "Creating ZooKeeper myid file for node ID $node_id"
+    sudo -u nifiadmin mkdir -p "$zookeeper_data_dir"
+    echo "$node_id" | sudo -u nifiadmin tee "${zookeeper_data_dir}/myid" > /dev/null
+    
+    # Set proper permissions
+    sudo -u nifiadmin chown nifiadmin:nifiadmin "${zookeeper_data_dir}/myid"
+    
+    # Verify myid file was created
+    if [ -f "${zookeeper_data_dir}/myid" ]; then
+        echo "ZooKeeper myid file created successfully with value: $(cat "${zookeeper_data_dir}/myid")"
+    else
+        echo "Failed to create ZooKeeper myid file"
+        exit 1
+    fi
+}
+
+setup_nifiadmin_authentication() {
+    local nifi_conf_dir="${NIFI_HOME}/nifi-${NIFI_VERSION}/conf"
+    local login_providers_file="${nifi_conf_dir}/login-identity-providers.xml"
+    
+    echo "Setting up nifiadmin authentication for NiFi UI..."
+
+    # Prompt for password with confirmation
+    while true; do
+        read -s -p "Enter password for nifiadmin user: " password
+        echo
+        read -s -p "Confirm password: " password_confirm
+        echo
+        
+        if [ "$password" != "$password_confirm" ]; then
+            echo "Error: Passwords do not match. Please try again."
+        elif [ -z "$password" ]; then
+            echo "Error: Password cannot be empty. Please try again."
+        else
+            break
+        fi
+    done
+
+    # Set single user credentials in NiFi
+    echo "Setting single user credentials in NiFi..."
+    sudo -u nifiadmin "${NIFI_HOME}/nifi-${NIFI_VERSION}/bin/nifi.sh" set-single-user-credentials nifiadmin "$password"
+
+    # Verify the file was created
+    if [ ! -f "$login_providers_file" ]; then
+        echo "Error: Failed to create login-identity-providers.xml"
+        exit 1
+    fi
+
+    # Set proper permissions
+    sudo -u nifiadmin chmod 640 "$login_providers_file"
+    echo "NiFi authentication setup complete."
+}
+
+configure_state_management() {
+    local state_management_file="${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/state-management.xml"
+    
+    echo "Configuring state management for NiFi cluster..."
+    
+    if [[ -z "$NODE_NAME1" || -z "$NODE_NAME2" || -z "$NODE_NAME3" ]]; then
+        echo "ERROR: Missing node names!"
+        exit 1
+    fi
+
+    cat << EOF | sudo -u nifiadmin tee "$state_management_file" > /dev/null
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<stateManagement>
+   <local-provider>
+        <id>local-provider</id>
+        <class>org.apache.nifi.controller.state.providers.local.WriteAheadLocalStateProvider</class>
+        <property name="Directory">./state/local</property>
+        <property name="Partitions">16</property>
+        <property name="Checkpoint Interval">2 mins</property>
+    </local-provider>
+
+    <cluster-provider>
+        <id>zk-provider</id>
+        <class>org.apache.nifi.controller.state.providers.zookeeper.ZooKeeperStateProvider</class>
+        <property name="Connect String">${NODE_NAME1}:2181,${NODE_NAME2}:2181,${NODE_NAME3}:2181</property>
+        <property name="Root Node">/nifi</property>
+        <property name="Session Timeout">10 seconds</property>
+        <property name="Access Control">Open</property>
+    </cluster-provider>
+</stateManagement>
+EOF
+
+    sudo chown -R nifiadmin:nifiadmin "${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/"
+    echo "State management configured successfully with ZK connection: ${NODE_NAME1}:2181,${NODE_NAME2}:2181,${NODE_NAME3}:2181"
+
+    echo "Copying security files to local conf directory..."
+    sudo -u nifiadmin sh -c "cp ${NIFI_HOME}/security_output/${NODE_IP1}/*.jks ${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/"
+    sudo -u nifiadmin chmod 640 ${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/*.jks
+}
+
+configure_nifi_properties() {
+    local nifi_props_file="${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/nifi.properties"
+    local current_ip=$(hostname -I | awk '{print $1}')
+    
+    echo "Configuring nifi.properties for cluster node with IP: $current_ip"
+    
+    # Prompt for NiFi web port
+    read -p "Enter NiFi web HTTPS port (default 9443): " nifi_port
+    nifi_port=${nifi_port:-9443}
+    
+    # Determine node-specific settings
+    local node_id=0
+    local node_identifier=""
+    
+    if [ "$current_ip" == "$NODE_IP1" ]; then
+        node_id=1
+        node_identifier="$NODE_NAME1"
+    elif [ "$current_ip" == "$NODE_IP2" ]; then
+        node_id=2
+        node_identifier="$NODE_NAME2"
+    elif [ "$current_ip" == "$NODE_IP3" ]; then
+        node_id=3
+        node_identifier="$NODE_NAME3"
+    else
+        echo "Error: Current IP $current_ip not found in cluster configuration"
+        exit 1
+    fi
+    
+    # Backup original file
+    sudo -u nifiadmin cp "$nifi_props_file" "${nifi_props_file}.bak"
+    
+    # Configure nifi.properties
+    cat << EOF | sudo -u nifiadmin tee "$nifi_props_file" > /dev/null
+# Core Properties #
+nifi.flow.configuration.file=./conf/flow.xml.gz
+nifi.flow.configuration.json.file=./conf/flow.json.gz
+nifi.flow.configuration.archive.enabled=true
+nifi.flow.configuration.archive.dir=./conf/archive/
+nifi.flow.configuration.archive.max.time=30 days
+nifi.flow.configuration.archive.max.storage=500 MB
+nifi.flow.configuration.archive.max.count=
+nifi.flowcontroller.autoResumeState=true
+nifi.flowcontroller.graceful.shutdown.period=10 sec
+nifi.flowservice.writedelay.interval=500 ms
+nifi.administrative.yield.duration=30 sec
+nifi.bored.yield.duration=10 millis
+nifi.queue.backpressure.count=10000
+nifi.queue.backpressure.size=1 GB
+
+nifi.authorizer.configuration.file=./conf/authorizers.xml
+nifi.login.identity.provider.configuration.file=./conf/login-identity-providers.xml
+nifi.templates.directory=./conf/templates
+nifi.ui.banner.text=
+nifi.ui.autorefresh.interval=30 sec
+nifi.nar.library.directory=./lib
+nifi.nar.library.autoload.directory=./extensions
+nifi.nar.working.directory=./work/nar/
+nifi.documentation.working.directory=./work/docs/components
+nifi.nar.unpack.uber.jar=false
+
+####################
+# State Management #
+####################
+nifi.state.management.configuration.file=./conf/state-management.xml
+nifi.state.management.provider.local=local-provider
+nifi.state.management.provider.cluster=zk-provider
+nifi.state.management.embedded.zookeeper.start=true
+nifi.state.management.embedded.zookeeper.properties=./conf/zookeeper.properties
+
+# H2 Settings
+nifi.database.directory=./database_repository
+nifi.h2.url.append=;LOCK_TIMEOUT=25000;WRITE_DELAY=0;AUTO_SERVER=FALSE
+
+# FlowFile Repository
+nifi.flowfile.repository.implementation=org.apache.nifi.controller.repository.WriteAheadFlowFileRepository
+nifi.flowfile.repository.wal.implementation=org.apache.nifi.wali.SequentialAccessWriteAheadLog
+nifi.flowfile.repository.directory=./flowfile_repository
+nifi.flowfile.repository.checkpoint.interval=20 secs
+nifi.flowfile.repository.always.sync=false
+
+# Content Repository
+nifi.content.repository.implementation=org.apache.nifi.controller.repository.FileSystemRepository
+nifi.content.repository.directory.default=./content_repository
+nifi.content.repository.always.sync=false
+
+# Provenance Repository
+nifi.provenance.repository.implementation=org.apache.nifi.provenance.WriteAheadProvenanceRepository
+nifi.provenance.repository.directory.default=./provenance_repository
+nifi.provenance.repository.max.storage.time=30 days
+nifi.provenance.repository.max.storage.size=10 GB
+
+# Web Properties
+nifi.web.https.host=${current_ip}
+nifi.web.https.port=${nifi_port}
+nifi.web.https.network.interface.default=
+nifi.web.proxy.host=${node_identifier}:${nifi_port}
+
+# security properties #
+nifi.sensitive.props.key=propkeywith12chars
+nifi.sensitive.props.key.protected=
+nifi.sensitive.props.algorithm=NIFI_PBKDF2_AES_GCM_256
+nifi.sensitive.props.additional.keys=
+
+nifi.security.keystore=./conf/keystore.jks
+nifi.security.keystoreType=jks
+nifi.security.keystorePasswd=${KEYSTORE_PASSWORD}
+nifi.security.keyPasswd=${KEYSTORE_PASSWORD}
+nifi.security.truststore=./conf/truststore.jks
+nifi.security.truststoreType=jks
+nifi.security.truststorePasswd=${TRUSTSTORE_PASSWORD}
+nifi.security.user.authorizer=single-user-authorizer
+nifi.security.allow.anonymous.authentication=false
+# code added on 16-4-2025
+
+# Enable single user auth
+nifi.security.user.login.identity.provider=single-user-provider
+nifi.security.user.authorizer=single-user-authorizer
+
+
+# Cluster Common Properties
+nifi.cluster.protocol.heartbeat.interval=5 sec
+nifi.cluster.protocol.is.secure=true
+
+# Cluster Node Properties
+nifi.cluster.is.node=true
+nifi.cluster.node.address=${node_identifier}
+nifi.cluster.node.protocol.port=11443
+nifi.cluster.node.protocol.max.threads=50
+
+# ZooKeeper Properties
+nifi.zookeeper.connect.string=${NODE_NAME1}:2181,${NODE_NAME2}:2181,${NODE_NAME3}:2181
+nifi.zookeeper.connect.timeout=10 secs
+nifi.zookeeper.session.timeout=10 secs
+nifi.zookeeper.root.node=/nifi
+
+# Site-to-Site Properties
+nifi.remote.input.host=${node_identifier}
+nifi.remote.input.secure=false
+nifi.remote.input.socket.port=10443
+EOF
+
+    # Set proper permissions
+    sudo chown nifiadmin:nifiadmin "$nifi_props_file"
+    
+    echo "nifi.properties configured successfully for node ${node_id} (${node_identifier})"
+}
+
+zip_distribute_local_nifi() {
+    local nifi_dir="${NIFI_HOME}/nifi-${NIFI_VERSION}"
+    local zip_file="${NIFI_HOME}/nifi-${NIFI_VERSION}-cluster.zip"
+    local ssh_user="nifiadmin"
+    local remote_dir="${NIFI_HOME}"
+    local current_ip=$(hostname -I | awk '{print $1}')
+    
+    echo "Archiving NiFi installation..."
+    cd "${NIFI_HOME}" || return 1
+    
+    if ! sudo -u nifiadmin zip -rq "${zip_file}" \
+        "nifi-${NIFI_VERSION}" \
+        -x "*logs/*" "*temp/*" "*.bak" "*.tmp"; then
+        echo "Error: Failed to create zip file!"
+        return 1
+    fi
+
+    # Distribute to each node (excluding current node)
+    for node in "${NODE_IP2}" "${NODE_IP3}"; do
+        [ "$node" == "$current_ip" ] && continue
+        
+        echo "Transferring to ${node}..."
+        sudo -u nifiadmin scp -o StrictHostKeyChecking=no "${zip_file}" "${ssh_user}@${node}:${remote_dir}/" || {
+            echo "Error: Failed to copy to ${node}"
+            continue
+        }
+
+        sudo -u nifiadmin ssh -n "${ssh_user}@${node}" "
+            echo 'Unzipping NiFi on ${node}...';
+            unzip -qo \"${remote_dir}/$(basename ${zip_file})\" -d \"${remote_dir}\" && \
+            chown -R nifiadmin:nifiadmin \"${remote_dir}/nifi-${NIFI_VERSION}\" && \
+            rm \"${remote_dir}/$(basename ${zip_file})\";
+            echo 'NiFi ${NIFI_VERSION} successfully deployed to ${node}';
+        " || echo "Warning: Failed to complete setup on ${node}"
+    done
+
+    rm -f "${zip_file}"
+    echo "NiFi distribution completed to all cluster nodes"
+}
+
+
+setup_cluster_nodes() {
+    # Process each node (starting from node 2)
+    for ((i=2; i<=CLUSTER_SIZE; i++)); do
+        local node_ip="NODE_IP$i"
+        local node_ip_value="${!node_ip}"
+        local node_name="NODE_NAME$i"
+        local node_name_value="${!node_name}"
+        local node_id="$i"  # ZooKeeper myid will be 2 for node 2, 3 for node 3, etc.
+        
+        echo "=================================================="
+        echo "Configuring node $i (${node_name_value} - IP: ${node_ip_value})"
+        echo "=================================================="
+
+        # Export all required variables
+        local export_vars="NIFI_VERSION=\"$NIFI_VERSION\" \
+                        NIFI_HOME=\"$NIFI_HOME\" \
+                        KEYSTORE_PASSWORD=\"$KEYSTORE_PASSWORD\" \
+                        TRUSTSTORE_PASSWORD=\"$TRUSTSTORE_PASSWORD\" \
+                        NODE_IP1=\"$NODE_IP1\" \
+                        NODE_IP2=\"$NODE_IP2\" \
+                        NODE_IP3=\"$NODE_IP3\" \
+                        NODE_NAME1=\"$NODE_NAME1\" \
+                        NODE_NAME2=\"$NODE_NAME2\" \
+                        NODE_NAME3=\"$NODE_NAME3\" \
+                        CURRENT_NODE_ID=\"$node_id\" \
+                        nifi_port=\"9443\""  # Added nifi_port with default value
+
+        # 1. Configure nifi.properties on remote node with node-specific IP
+        echo "Setting up nifi.properties for ${node_ip_value}..."
+        if ! ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "$export_vars; $(declare -f configure_nifi_properties); configure_nifi_properties"; then
+            echo "ERROR: Failed to configure nifi.properties on ${node_name_value}"
+            return 1
+        fi
+
+        # 2. Configure ZooKeeper with correct myid
+        echo "Configuring ZooKeeper (myid=$node_id) on ${node_ip_value}..."
+        if ! ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "$export_vars; $(declare -f configure_zookeeper); configure_zookeeper"; then
+            echo "ERROR: Failed to configure Zookeeper on ${node_name_value}"
+            return 1
+        fi
+
+        # 3. Copy security files
+        echo "Copying security files to ${node_ip_value}..."
+        if ! sudo -u nifiadmin scp -o StrictHostKeyChecking=no \
+            "${NIFI_HOME}/security_output/${node_ip_value}"/*.jks \
+            nifiadmin@${node_ip_value}:${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/; then
+            echo "ERROR: Failed to copy security files to ${node_name_value}"
+            return 1
+        fi
+
+        # 4. Set permissions
+        echo "Setting permissions on ${node_ip_value}..."
+        if ! ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "chown -R nifiadmin:nifiadmin ${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/ && \
+             chmod 640 ${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/*.jks"; then
+            echo "ERROR: Failed to set permissions on ${node_name_value}"
+            return 1
+        fi
+
+        echo "Successfully configured node ${node_name_value} with ZooKeeper myid=${node_id}"
+    done
+}
+
+
+start_nifi_cluster() {
+    # Get the dynamically assigned port from nifi.properties
+    local nifi_port=$(grep -E "^nifi.web.https.port" "${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/nifi.properties" | cut -d'=' -f2)
+    nifi_port=${nifi_port:-9443}  # Default if not found
+    
+    echo "Starting NiFi cluster on all nodes using port $nifi_port..."
+    
+    # First start ZooKeeper on all nodes
+    echo "Starting ZooKeeper ensemble..."
+    for ((i=1; i<=CLUSTER_SIZE; i++)); do
+        local node_ip="NODE_IP$i"
+        local node_ip_value="${!node_ip}"
+        
+        ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "export JAVA_HOME=${JAVA_HOME}; ${NIFI_HOME}/nifi-${NIFI_VERSION}/bin/zookeeper-server-start.sh -daemon ${NIFI_HOME}/nifi-${NIFI_VERSION}/conf/zookeeper.properties"
+    done
+    
+    # Wait for ZooKeeper ensemble to form
+    echo "Waiting for ZooKeeper ensemble to form (30 seconds)..."
+    sleep 30
+    
+    # Verify ZooKeeper is running on all nodes
+    for ((i=1; i<=CLUSTER_SIZE; i++)); do
+        local node_ip="NODE_IP$i"
+        local node_ip_value="${!node_ip}"
+        local node_name="NODE_NAME$i"
+        local node_name_value="${!node_name}"
+        
+        if ! ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "netstat -tuln | grep -q 2181"; then
+            echo "ERROR: ZooKeeper not running on ${node_name_value}"
+            return 1
+        fi
+    done
+    
+    # Now start NiFi on each node
+    for ((i=1; i<=CLUSTER_SIZE; i++)); do
+        local node_ip="NODE_IP$i"
+        local node_ip_value="${!node_ip}"
+        local node_name="NODE_NAME$i"
+        local node_name_value="${!node_name}"
+        
+        echo "Starting NiFi on ${node_name_value} (${node_ip_value})..."
+        
+        # Start NiFi with proper JAVA_HOME and in background
+        ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+            "export JAVA_HOME=${JAVA_HOME}; nohup ${NIFI_HOME}/nifi-${NIFI_VERSION}/bin/nifi.sh start > ${NIFI_HOME}/nifi-startup.log 2>&1 &"
+        
+        # Verify startup
+        local max_attempts=30
+        local attempt=0
+        local nifi_started=false
+        
+        while [ $attempt -lt $max_attempts ]; do
+            if ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+                "netstat -tuln | grep -q '${nifi_port}'"; then
+                nifi_started=true
+                break
+            fi
+            attempt=$((attempt + 1))
+            sleep 10
+            echo "Waiting for NiFi to start on ${node_name_value} (attempt $attempt/$max_attempts)..."
+        done
+        
+        if $nifi_started; then
+            echo "NiFi successfully started on ${node_name_value}"
+            echo "UI available at: https://${node_ip_value}:${nifi_port}"
+        else
+            echo "ERROR: Failed to start NiFi on ${node_name_value}"
+            ssh -o StrictHostKeyChecking=no nifiadmin@${node_ip_value} \
+                "cat ${NIFI_HOME}/nifi-startup.log"
+            return 1
+        fi
+    done
+    
+    echo "NiFi cluster started successfully on all nodes"
+}
+main() {
+    check_os
+    check_java
+    set_java_home
+    check_nifiadmin_user
+    download_nifi
+    download_nifi_toolkit
+    generate_tls_certs
+    setup_nifiadmin_authentication
+    configure_zookeeper
+    configure_state_management
+    configure_nifi_properties
+    zip_distribute_local_nifi
+    setup_cluster_nodes
+    start_nifi_cluster
+    
+}
+
+main
